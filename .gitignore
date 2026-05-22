@@ -1,0 +1,7 @@
+.DS_Store
+.metadata/
+Debug/
+.git_test_write
+.osx.project
+*.log
+*.tmp
