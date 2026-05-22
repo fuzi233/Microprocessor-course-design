@@ -1,7 +1,22 @@
-.DS_Store
-.metadata/
+# STM32CubeIDE
 Debug/
-.git_test_write
+Release/
+.metadata/
+.settings/
+*.launch
+*.cyclo
+*.su
+*.d
+*.o
+
+# macOS
+__MACOSX/
+._*
+.DS_Store
 .osx.project
+
+# Temp
 *.log
 *.tmp
+*.bak
+.git_test_write
