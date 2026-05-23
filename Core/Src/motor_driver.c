@@ -46,6 +46,8 @@ static void apply_pwm_single_polarity(MotorID_t motor, int32_t pwm, bool forward
     else
     {
         // 右电机：BIN1=PB6(TIM4_CH1), BIN2=PB7
+        // 右电机物理安装方向与左电机相反，编码器也取反，
+        // 故方向引脚逻辑与左电机相反：前进=BIN2低电平
         if (forward)
         {
             __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_1, pwm);

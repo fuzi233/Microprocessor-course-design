@@ -17,12 +17,9 @@ static bool RPLidar_FrameLooksValid(const uint8_t frame[RPLIDAR_SCAN_SAMPLE_SIZE
 
 static void RPLidar_DecodeSample(RPLidarContext *ctx, const uint8_t frame[RPLIDAR_SCAN_SAMPLE_SIZE])
 {
-  LidarRawNode *raw_node;
   RPLidarScanSample *sample = &ctx->latest_sample;
   uint16_t angle_q6;
-  uint16_t distance_mm;
   uint16_t distance_q2;
-  uint8_t flags;
 
   sample->start_flag = (frame[0] & 0x01U) != 0U;
   sample->inverse_start_flag = (frame[0] & 0x02U) != 0U;
@@ -37,35 +34,11 @@ static void RPLidar_DecodeSample(RPLidarContext *ctx, const uint8_t frame[RPLIDA
 
   angle_q6 = (uint16_t)(((uint16_t)frame[1] >> 1) | ((uint16_t)frame[2] << 7));
   distance_q2 = (uint16_t)((uint16_t)frame[3] | ((uint16_t)frame[4] << 8));
-  distance_mm = (uint16_t)(distance_q2 / 4U);
 
   sample->raw_angle_q6 = angle_q6;
   sample->raw_distance_q2 = distance_q2;
   sample->angle_deg = (float)angle_q6 / 64.0f;
-  sample->distance_mm = (float)distance_mm;
-
-  flags = 0U;
-  if (sample->start_flag)
-  {
-    flags |= LIDAR_RAW_NODE_FLAG_START;
-  }
-  if (sample->check_bit_ok)
-  {
-    flags |= LIDAR_RAW_NODE_FLAG_CHECK_OK;
-  }
-  if ((distance_mm >= 80U) && (distance_mm <= 3000U))
-  {
-    flags |= LIDAR_RAW_NODE_FLAG_VALID_DISTANCE;
-  }
-
-  if (ctx->decoded_node_count < RPLIDAR_DECODED_NODE_BUFFER_SIZE)
-  {
-    raw_node = &ctx->decoded_nodes[ctx->decoded_node_count++];
-    raw_node->angle_q6 = angle_q6;
-    raw_node->distance_mm = distance_mm;
-    raw_node->quality = sample->quality;
-    raw_node->flags = flags;
-  }
+  sample->distance_mm = (float)distance_q2 / 4.0f;
 
   ctx->frame_count++;
   ctx->sample_ready = true;
@@ -95,8 +68,6 @@ HAL_StatusTypeDef RPLidar_StartScanReception(RPLidarContext *ctx)
 void RPLidar_ProcessBytes(RPLidarContext *ctx, const uint8_t *data, size_t len)
 {
   size_t i;
-
-  ctx->decoded_node_count = 0U;
 
   for (i = 0; i < len; ++i)
   {

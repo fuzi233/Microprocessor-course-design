@@ -22,6 +22,7 @@
 #include "motor_driver.h"
 #include "lidar_pipeline.h"
 #include "car_control.h"
+#include "nav_embed_adapter.h"
 
 /* USER CODE END Includes */
 
@@ -48,6 +49,14 @@
 
 /* 传感器轮询周期 */
 #define IMU_POLL_PERIOD_MS  20U
+#define NAV_CONTROL_STARTUP_DELAY_MS  2000U
+
+/* ---- 电机测试模式 ----
+ * 定义以下宏将跳过导航算法，直接驱动电机做往复测试:
+ *   前进 2 秒 → 停止 1 秒 → 后退 2 秒 → 停止 1 秒 → 循环
+ * 用于验证电机接线、PWM、编码器是否正常。
+ * 正式使用时请注释掉此行。 */
+#define ENABLE_MOTOR_TEST
 
 /* USER CODE END PD */
 
@@ -77,6 +86,9 @@ DMA_HandleTypeDef hdma_usart3_rx;
 static MPU6500Context g_mpu6500;
 static RPLidarContext g_rplidar;
 static CarContext_t g_car;
+static NavEmbedAdapter g_nav_adapter;
+static NavCommand g_nav_command;
+static volatile uint8_t g_nav_command_valid = 0U;
 static volatile uint8_t g_mpu_dma_busy = 0U;
 static volatile uint8_t g_lidar_rx_active = 0U;
 
@@ -109,6 +121,7 @@ static void OLED_Update_Task(void *argument);
 static void PIDControl_Task(void *argument);
 static void EncoderOutput_Task(void *argument);
 static void YawOutput_Task(void *argument);
+static const char *Nav_StatusString(NavRuntimeStatus status);
 
 /* USER CODE END PFP */
 
@@ -125,6 +138,23 @@ static uint32_t prev_time = 0;
 static uint32_t last_mpu_data_time = 0;
 static uint32_t last_mpu_dma_start_time = 0;
 static bool mpu_dma_started = false;
+
+static const char *Nav_StatusString(NavRuntimeStatus status)
+{
+    switch (status)
+    {
+        case NAV_RUNTIME_WAITING_FOR_POSE:
+            return "WAIT_POSE";
+        case NAV_RUNTIME_WAITING_FOR_SCAN:
+            return "WAIT_SCAN";
+        case NAV_RUNTIME_EXPLORING:
+            return "EXPLORE";
+        case NAV_RUNTIME_FINISHED:
+            return "FINISHED";
+        default:
+            return "UNKNOWN";
+    }
+}
 
 static void Debug_Print(const char *message)
 {
@@ -244,94 +274,116 @@ static void IMU_Update_Task(void *argument)
     }
 }
 
-/* PID控制任务 - 10ms周期控制电机速度 */
+/* ---- 电机测试任务 (ENABLE_MOTOR_TEST 时使用) ---- */
+#ifdef ENABLE_MOTOR_TEST
+static void MotorTest_Task(void *argument)
+{
+    (void)argument;
+    int32_t test_speed = TARGET_TICKS_PER_PERIOD / 2;  /* 半速测试 */
+    uint8_t test_phase = 0;
+    TickType_t phase_start = xTaskGetTickCount();
+    char dbg[64];
+
+    vTaskDelay(pdMS_TO_TICKS(1000));
+
+    for (;;)
+    {
+        uint32_t elapsed = (xTaskGetTickCount() - phase_start) * portTICK_PERIOD_MS;
+
+        switch (test_phase)
+        {
+            case 0:  /* 前进 2 秒 */
+                MotorDriver_SetTargetSpeed(MOTOR_LEFT, test_speed);
+                MotorDriver_SetTargetSpeed(MOTOR_RIGHT, test_speed);
+                if (elapsed >= 2000U) { test_phase = 1; phase_start = xTaskGetTickCount(); }
+                break;
+            case 1:  /* 停止 1 秒 */
+                MotorDriver_SetTargetSpeed(MOTOR_BOTH, 0);
+                MotorDriver_StopMotor(MOTOR_BOTH);
+                if (elapsed >= 1000U) { test_phase = 2; phase_start = xTaskGetTickCount(); }
+                break;
+            case 2:  /* 后退 2 秒 */
+                MotorDriver_SetTargetSpeed(MOTOR_LEFT, -test_speed);
+                MotorDriver_SetTargetSpeed(MOTOR_RIGHT, -test_speed);
+                if (elapsed >= 2000U) { test_phase = 3; phase_start = xTaskGetTickCount(); }
+                break;
+            case 3:  /* 停止 1 秒 */
+                MotorDriver_SetTargetSpeed(MOTOR_BOTH, 0);
+                MotorDriver_StopMotor(MOTOR_BOTH);
+                if (elapsed >= 1000U) { test_phase = 0; phase_start = xTaskGetTickCount(); }
+                break;
+        }
+
+        MotorDriver_PIDControl(MOTOR_BOTH);
+
+        snprintf(dbg, sizeof(dbg),
+                 "MOTOR_TEST phase=%u L_enc=%ld R_enc=%ld L_pwm=%ld R_pwm=%ld\r\n",
+                 test_phase,
+                 (long)MotorDriver_GetEncoderCount(MOTOR_LEFT),
+                 (long)MotorDriver_GetEncoderCount(MOTOR_RIGHT),
+                 (long)MotorDriver_GetCurrentPWM(MOTOR_LEFT),
+                 (long)MotorDriver_GetCurrentPWM(MOTOR_RIGHT));
+        HAL_UART_Transmit(&huart2, (uint8_t *)dbg, strlen(dbg), 100U);
+
+        vTaskDelay(pdMS_TO_TICKS(PID_CONTROL_PERIOD_MS));
+    }
+}
+#endif /* ENABLE_MOTOR_TEST */
+
+/* 导航主控制任务 — 10ms 周期
+ * 严格按照 Algo/README 第 3.2 节流程:
+ *   位姿更新 → 雷达摄取 → 建图膨胀 → Frontier → A* → 跟踪 → 避障 → 电机指令
+ * 每个周期运行 PID 闭环维持目标速度，仅在探索完成时停车。 */
 static void PIDControl_Task(void *argument)
 {
     (void)argument;
-    
-    vTaskDelay(pdMS_TO_TICKS(2000));
-    
-    uint32_t phase_time = 0;
-    uint8_t phase = 0;
-    
+    NavCommand nav_cmd = {0.0f, 0.0f};
+    bool nav_active = false;
+
+    /* 启动延时，等待 IMU / 雷达 / FreeRTOS 就绪 */
+    vTaskDelay(pdMS_TO_TICKS(NAV_CONTROL_STARTUP_DELAY_MS));
+
     for (;;)
     {
-        if (phase == 0)
+        /* ---- 首次运行：初始化全局位姿 ---- */
+        if (!g_nav_adapter.runtime.pose_initialized && g_mpu6500.gyro.who_am_i_ok)
         {
-            if (phase_time == 0)
-            {
-                int32_t target_per_period = CAR_DEFAULT_SPEED * CAR_CONTROL_PERIOD_MS / 1000;
-                MotorDriver_SetTargetSpeed(MOTOR_BOTH, target_per_period);
-                
-                if (g_mpu6500.gyro.who_am_i_ok)
-                {
-                    MPU6500_UpdateYaw(&g_mpu6500);
-                    g_car.target_heading = MPU6500_GetYaw(&g_mpu6500);
-                    g_car.yaw_integral = 0.0f;
-                    g_car.last_yaw_error = 0.0f;
-                }
-            }
-            
-            if (g_mpu6500.gyro.who_am_i_ok && g_mpu6500.gyro.data_ready)
-            {
-                MPU6500_UpdateYaw(&g_mpu6500);
-                float current_yaw = MPU6500_GetYaw(&g_mpu6500);
-                float yaw_error = g_car.target_heading - current_yaw;
-                
-                if (yaw_error > 180.0f) yaw_error -= 360.0f;
-                if (yaw_error < -180.0f) yaw_error += 360.0f;
-                
-                float dt = CAR_CONTROL_PERIOD_MS / 1000.0f;
-                g_car.yaw_integral += yaw_error * dt;
-                float derivative = (yaw_error - g_car.last_yaw_error) / dt;
-                g_car.last_yaw_error = yaw_error;
-                
-                float yaw_output = g_car.yaw_kp * yaw_error + g_car.yaw_ki * g_car.yaw_integral + g_car.yaw_kd * derivative;
-                
-                if (yaw_output > 1000.0f) yaw_output = 1000.0f;
-                if (yaw_output < -1000.0f) yaw_output = -1000.0f;
-                
-                int32_t base_speed = CAR_DEFAULT_SPEED * CAR_CONTROL_PERIOD_MS / 1000;
-                int32_t left_speed = base_speed + (int32_t)yaw_output;
-                int32_t right_speed = base_speed - (int32_t)yaw_output;
-                
-                if (left_speed > 5000) left_speed = 5000;
-                if (left_speed < 0) left_speed = 0;
-                if (right_speed > 5000) right_speed = 5000;
-                if (right_speed < 0) right_speed = 0;
-                
-                MotorDriver_SetTargetSpeed(MOTOR_LEFT, left_speed);
-                MotorDriver_SetTargetSpeed(MOTOR_RIGHT, right_speed);
-            }
-            
+            MPU6500_UpdateYaw(&g_mpu6500);
+            NavEmbedAdapter_ResetPose(&g_nav_adapter,
+                                      0.0f, 0.0f,
+                                      MPU6500_GetYaw(&g_mpu6500));
+        }
+
+        /* ---- 运行完整导航链路 ---- */
+        if (g_nav_adapter.runtime.pose_initialized && g_mpu6500.gyro.who_am_i_ok)
+        {
+            nav_active = NavEmbedAdapter_Update(&g_nav_adapter,
+                                                &g_mpu6500,
+                                                &g_rplidar,
+                                                &nav_cmd);
+        }
+
+        /* ---- 执行电机指令 ---- */
+        if (nav_active)
+        {
+            g_nav_command = nav_cmd;
+            g_nav_command_valid = 1U;
+            NavEmbedAdapter_ApplyCommand(&g_nav_adapter, &nav_cmd);
+            phase = 0U;
+        }
+        else if (g_nav_adapter.runtime.status == NAV_RUNTIME_FINISHED)
+        {
+            g_nav_command_valid = 0U;
+            NavEmbedAdapter_Stop();
+            phase = 1U;
+        }
+
+        /* ---- PID 闭环：每周期维持目标速度 ---- */
+        if (nav_active)
+        {
             MotorDriver_PIDControl(MOTOR_BOTH);
         }
-        else
-        {
-            MotorDriver_SetTargetSpeed(MOTOR_BOTH, 0);
-            MotorDriver_StopMotor(MOTOR_BOTH);
-        }
-        
-        phase_time += PID_CONTROL_PERIOD_MS;
-        
-        if ((phase == 0 && phase_time >= 2000) || (phase == 1 && phase_time >= 4000))
-        {
-            phase = 1 - phase;
-            phase_time = 0;
-            
-            if (phase == 0)
-            {
-                MotorDriver_ResetEncoder(MOTOR_BOTH);
-                if (g_mpu6500.gyro.who_am_i_ok)
-                {
-                    MPU6500_UpdateYaw(&g_mpu6500);
-                    g_car.target_heading = MPU6500_GetYaw(&g_mpu6500);
-                    g_car.yaw_integral = 0.0f;
-                    g_car.last_yaw_error = 0.0f;
-                }
-            }
-        }
-        
+
         vTaskDelay(pdMS_TO_TICKS(PID_CONTROL_PERIOD_MS));
     }
 }
@@ -412,13 +464,17 @@ static void EncoderOutput_Task(void *argument)
         snprintf(buffer, sizeof(buffer), 
                  "[%s] Enc: L=%6ld R=%6ld | Total: L=%6ld R=%6ld | "
                  "Spd(sec): L=%5ld R=%5ld | Spd(cycle): L=%5ld R=%5ld | "
-                 "PWM: L=%5ld R=%5ld\r\n", 
-                 (phase == 0) ? "MOVING" : "STOP  ",
+                 "PWM: L=%5ld R=%5ld | Path:%u Free:%lu Cmd:(%.0f,%.2f)\r\n", 
+                 Nav_StatusString(g_nav_adapter.runtime.status),
                  (long)left_enc, (long)right_enc,
                  (long)left_total, (long)right_total,
                  (long)left_speed_per_sec, (long)right_speed_per_sec,
                  (long)left_speed_cycle, (long)right_speed_cycle,
-                 (long)left_pwm, (long)right_pwm);
+                 (long)left_pwm, (long)right_pwm,
+                 (unsigned int)g_nav_adapter.runtime.path.count,
+                 (unsigned long)NavGridMap_CountKnownFree(&g_nav_adapter.runtime.map),
+                 (double)g_nav_command.linear_vel_mms,
+                 (double)g_nav_command.angular_vel_rads);
         
         // 通过串口输出
         HAL_UART_Transmit(&huart2, (uint8_t *)buffer, strlen(buffer), 100U);
@@ -440,17 +496,16 @@ static void YawOutput_Task(void *argument)
         MPU6500_UpdateYaw(&g_mpu6500);
         
         float current_yaw = MPU6500_GetYaw(&g_mpu6500);
-        float yaw_error = g_car.target_heading - current_yaw;
-        if (yaw_error > 180.0f) yaw_error -= 360.0f;
-        if (yaw_error < -180.0f) yaw_error += 360.0f;
         
         snprintf(buffer, sizeof(buffer), 
-                 "[YAW] Cur:%.1f Tgt:%.1f Err:%.1f | "
-                 "Int:%.1f | GyroZ:%.1f\r\n", 
+                 "[NAV] Yaw:%.1f Pose:(%.0f,%.0f) Goal:%d Path:%u Front:%u CmdOK:%u GyroZ:%.1f\r\n", 
                  (double)current_yaw, 
-                 (double)g_car.target_heading, 
-                 (double)yaw_error,
-                 (double)g_car.yaw_integral,
+                 (double)g_nav_adapter.runtime.pose.x_mm,
+                 (double)g_nav_adapter.runtime.pose.y_mm,
+                 g_nav_adapter.runtime.has_goal ? 1 : 0,
+                 (unsigned int)g_nav_adapter.runtime.path.count,
+                 (unsigned int)g_nav_adapter.runtime.frontier_count,
+                 (unsigned int)g_nav_command_valid,
                  (double)g_mpu6500.gyro.dps_z);
         
         HAL_UART_Transmit(&huart2, (uint8_t *)buffer, strlen(buffer), 100U);
@@ -538,7 +593,7 @@ static void OLED_Update_Task(void *argument)
         now = HAL_GetTick();
 
         /* 第0行: 标题 */
-        SSD1306_Print(0, 0, "PID Control");
+        SSD1306_Print(0, 0, "AIgo Nav");
 
         /* 第1行: 编码器数据 */
         SSD1306_printf(1, 0, "E:L%6ld R%6ld", 
@@ -552,7 +607,10 @@ static void OLED_Update_Task(void *argument)
         SSD1306_printf(3, 0, "  R%5ld/s", (long)right_speed);
 
         /* 第4行: 目标速度 */
-        SSD1306_printf(4, 0, "Tgt:%5d/s", TARGET_TICKS_PER_SECOND);
+        SSD1306_printf(4, 0, "%s", Nav_StatusString(g_nav_adapter.runtime.status));
+        SSD1306_printf(5, 0, "V%.0f W%.1f",
+                         (double)g_nav_command.linear_vel_mms,
+                         (double)g_nav_command.angular_vel_rads);
 
         /* 第7行: 时间 */
         SSD1306_printf(7, 0, "T:%lu", (unsigned long)(now / 1000));
@@ -687,6 +745,18 @@ int main(void)
   /* ---- 启动LiDAR Pipeline ---- */
   RPLidar_Init(&g_rplidar, &huart3);
   LidarPipeline_Start(&g_rplidar, Debug_Print);
+  {
+    NavRuntimeConfig nav_config;
+    NavRuntime_SetDefaultConfig(&nav_config);
+    nav_config.lookahead_mm = 180.0f;
+    nav_config.cruise_speed_mms = 140.0f;
+    nav_config.goal_tolerance_mm = 100.0f;
+    nav_config.avoidance_block_distance_mm = 350.0f;
+    nav_config.avoidance_emergency_distance_mm = 200.0f;
+    nav_config.inflation_radius_cells = 3U;
+    nav_config.min_scan_points_for_mapping = 8U;
+    NavEmbedAdapter_Init(&g_nav_adapter, &nav_config);
+  }
 
   if (RPLidar_StartScanReception(&g_rplidar) == HAL_OK)
   {
@@ -699,9 +769,14 @@ int main(void)
 
   /* ---- 创建FreeRTOS任务 ---- */
 
-  /* PID控制任务 - 优先级较高 */
+  /* PID控制任务 / 电机测试任务 */
+#ifdef ENABLE_MOTOR_TEST
+  xTaskCreate(MotorTest_Task, "MotorTest", STACK_BUTTON, NULL,
+              PRIO_BUTTON, NULL);
+#else
   xTaskCreate(PIDControl_Task, "PIDControl", STACK_BUTTON, NULL,
               PRIO_BUTTON, NULL);
+#endif
 
   /* IMU 周期采样 */
   xTaskCreate(IMU_Update_Task, "IMU", STACK_IMU, NULL,
