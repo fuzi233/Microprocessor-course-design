@@ -49,6 +49,11 @@
 /* 传感器轮询周期 */
 #define IMU_POLL_PERIOD_MS  20U
 
+/* 启动阶段电机平滑参数 */
+#define MOTOR_STARTUP_RAMP_MS     400U
+#define MOTOR_LEFT_SPEED_TRIM     (-4)
+#define MOTOR_RIGHT_SPEED_TRIM    (0)
+
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -103,12 +108,16 @@ static void MX_USART3_UART_Init(void);
 /* ========== 任务函数声明 ========== */
 static void Debug_Print(const char *message);
 static void Debug_PrintOLEDStatus(void);
+static void CreateTaskOrHalt(TaskFunction_t task_code, const char *name, const configSTACK_DEPTH_TYPE stack_depth,
+                             void *parameters, UBaseType_t priority);
+static int32_t ClampForwardMotorTarget(int32_t speed);
 static void Button_EventHandler(ButtonId id, ButtonEvent event);
 static void IMU_Update_Task(void *argument);
 static void OLED_Update_Task(void *argument);
 static void PIDControl_Task(void *argument);
 static void EncoderOutput_Task(void *argument);
 static void YawOutput_Task(void *argument);
+static void LidarDiagnostic_Task(void *argument);
 
 /* USER CODE END PFP */
 
@@ -149,6 +158,32 @@ static void Debug_PrintOLEDStatus(void)
              (unsigned long)HAL_I2C_GetError(&hi2c1),
              (unsigned long)HAL_I2C_GetState(&hi2c1));
     Debug_Print(msg);
+}
+
+static void CreateTaskOrHalt(TaskFunction_t task_code, const char *name, const configSTACK_DEPTH_TYPE stack_depth,
+                             void *parameters, UBaseType_t priority)
+{
+    char msg[96];
+
+    if (xTaskCreate(task_code, name, stack_depth, parameters, priority, NULL) != pdPASS)
+    {
+        snprintf(msg, sizeof(msg), "Task create failed: %s\r\n", name);
+        Debug_Print(msg);
+        Error_Handler();
+    }
+}
+
+static int32_t ClampForwardMotorTarget(int32_t speed)
+{
+    if (speed > 5000)
+    {
+        return 5000;
+    }
+    if (speed < 0)
+    {
+        return 0;
+    }
+    return speed;
 }
 
 /* ========== I2C 总线互斥锁 API ========== */
@@ -251,6 +286,7 @@ static void PIDControl_Task(void *argument)
     
     vTaskDelay(pdMS_TO_TICKS(2000));
     
+    int32_t base_speed_target = CAR_DEFAULT_SPEED * CAR_CONTROL_PERIOD_MS / 1000;
     uint32_t phase_time = 0;
     uint8_t phase = 0;
     
@@ -260,9 +296,6 @@ static void PIDControl_Task(void *argument)
         {
             if (phase_time == 0)
             {
-                int32_t target_per_period = CAR_DEFAULT_SPEED * CAR_CONTROL_PERIOD_MS / 1000;
-                MotorDriver_SetTargetSpeed(MOTOR_BOTH, target_per_period);
-                
                 if (g_mpu6500.gyro.who_am_i_ok)
                 {
                     MPU6500_UpdateYaw(&g_mpu6500);
@@ -271,6 +304,11 @@ static void PIDControl_Task(void *argument)
                     g_car.last_yaw_error = 0.0f;
                 }
             }
+
+            uint32_t ramp_elapsed_ms = (phase_time < MOTOR_STARTUP_RAMP_MS) ? phase_time : MOTOR_STARTUP_RAMP_MS;
+            int32_t ramped_base_speed = (int32_t)((base_speed_target * (int32_t)ramp_elapsed_ms) / (int32_t)MOTOR_STARTUP_RAMP_MS);
+            int32_t left_speed = ClampForwardMotorTarget(ramped_base_speed + MOTOR_LEFT_SPEED_TRIM);
+            int32_t right_speed = ClampForwardMotorTarget(ramped_base_speed + MOTOR_RIGHT_SPEED_TRIM);
             
             if (g_mpu6500.gyro.who_am_i_ok && g_mpu6500.gyro.data_ready)
             {
@@ -291,18 +329,12 @@ static void PIDControl_Task(void *argument)
                 if (yaw_output > 1000.0f) yaw_output = 1000.0f;
                 if (yaw_output < -1000.0f) yaw_output = -1000.0f;
                 
-                int32_t base_speed = CAR_DEFAULT_SPEED * CAR_CONTROL_PERIOD_MS / 1000;
-                int32_t left_speed = base_speed + (int32_t)yaw_output;
-                int32_t right_speed = base_speed - (int32_t)yaw_output;
-                
-                if (left_speed > 5000) left_speed = 5000;
-                if (left_speed < 0) left_speed = 0;
-                if (right_speed > 5000) right_speed = 5000;
-                if (right_speed < 0) right_speed = 0;
-                
-                MotorDriver_SetTargetSpeed(MOTOR_LEFT, left_speed);
-                MotorDriver_SetTargetSpeed(MOTOR_RIGHT, right_speed);
+                left_speed = ClampForwardMotorTarget(left_speed + (int32_t)yaw_output);
+                right_speed = ClampForwardMotorTarget(right_speed - (int32_t)yaw_output);
             }
+
+            MotorDriver_SetTargetSpeed(MOTOR_LEFT, left_speed);
+            MotorDriver_SetTargetSpeed(MOTOR_RIGHT, right_speed);
             
             MotorDriver_PIDControl(MOTOR_BOTH);
         }
@@ -490,6 +522,69 @@ static void HighFreqDebug_Task(void *argument)
         HAL_UART_Transmit(&huart2, (uint8_t *)buffer, strlen(buffer), 100U);
         
         vTaskDelay(pdMS_TO_TICKS(100));
+    }
+}
+
+static void LidarDiagnostic_Task(void *argument)
+{
+    (void)argument;
+    static char buffer[384];
+    static LidarRawFrame raw_frame;
+    static LidarSector32Frame sector_frame;
+    uint8_t i;
+
+    vTaskDelay(pdMS_TO_TICKS(2500));
+
+    for (;;)
+    {
+        bool raw_ready = LidarPipeline_GetLatestRawFrame(&raw_frame);
+        bool sector_ready = LidarPipeline_GetLatestSector32Frame(&sector_frame);
+        uint8_t valid_sector_count = 0U;
+        uint8_t nearest_sector = 0U;
+        uint16_t nearest_mm = 0U;
+        uint16_t latest_distance_mm = (uint16_t)g_rplidar.latest_sample.distance_mm;
+        uint16_t latest_angle_q6 = g_rplidar.latest_sample.raw_angle_q6;
+        float latest_angle_deg = (float)latest_angle_q6 / 64.0f;
+
+        if (sector_ready)
+        {
+            for (i = 0U; i < sector_frame.sector_count; ++i)
+            {
+                if (!sector_frame.sectors[i].valid)
+                {
+                    continue;
+                }
+
+                valid_sector_count++;
+                if ((nearest_mm == 0U) || (sector_frame.sectors[i].min_distance_mm < nearest_mm))
+                {
+                    nearest_mm = sector_frame.sectors[i].min_distance_mm;
+                    nearest_sector = i;
+                }
+            }
+        }
+
+        snprintf(buffer, sizeof(buffer),
+                 "[LIDAR] rx=%u frame_cnt=%lu err=%lu decoded=%u latest={q=%u ang=%.1f dist=%u start=%u} "
+                 "raw={ok=%u id=%lu samples=%u} sector={ok=%u valid=%u nearest=S%u/%u}\r\n",
+                 (unsigned int)g_lidar_rx_active,
+                 (unsigned long)g_rplidar.frame_count,
+                 (unsigned long)g_rplidar.parse_error_count,
+                 (unsigned int)g_rplidar.decoded_node_count,
+                 (unsigned int)g_rplidar.latest_sample.quality,
+                 (double)latest_angle_deg,
+                 (unsigned int)latest_distance_mm,
+                 g_rplidar.latest_sample.start_flag ? 1U : 0U,
+                 raw_ready ? 1U : 0U,
+                 raw_ready ? (unsigned long)raw_frame.frame_id : 0UL,
+                 raw_ready ? (unsigned int)raw_frame.sample_count : 0U,
+                 sector_ready ? 1U : 0U,
+                 (unsigned int)valid_sector_count,
+                 (unsigned int)nearest_sector,
+                 (unsigned int)nearest_mm);
+
+        HAL_UART_Transmit(&huart2, (uint8_t *)buffer, strlen(buffer), 100U);
+        vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }
 
@@ -686,7 +781,11 @@ int main(void)
 
   /* ---- 启动LiDAR Pipeline ---- */
   RPLidar_Init(&g_rplidar, &huart3);
-  LidarPipeline_Start(&g_rplidar, Debug_Print);
+  if (!LidarPipeline_Start(&g_rplidar, Debug_Print))
+  {
+    Debug_Print("LidarPipeline start failed!\r\n");
+    Error_Handler();
+  }
 
   if (RPLidar_StartScanReception(&g_rplidar) == HAL_OK)
   {
@@ -700,28 +799,25 @@ int main(void)
   /* ---- 创建FreeRTOS任务 ---- */
 
   /* PID控制任务 - 优先级较高 */
-  xTaskCreate(PIDControl_Task, "PIDControl", STACK_BUTTON, NULL,
-              PRIO_BUTTON, NULL);
+  CreateTaskOrHalt(PIDControl_Task, "PIDControl", STACK_BUTTON, NULL, PRIO_BUTTON);
 
   /* IMU 周期采样 */
-  xTaskCreate(IMU_Update_Task, "IMU", STACK_IMU, NULL,
-              PRIO_IMU, NULL);
+  CreateTaskOrHalt(IMU_Update_Task, "IMU", STACK_IMU, NULL, PRIO_IMU);
 
   /* 按键消抖 */
-  xTaskCreate(Button_Task, "Button", STACK_BUTTON, NULL,
-              PRIO_BUTTON, NULL);
+  CreateTaskOrHalt(Button_Task, "Button", STACK_BUTTON, NULL, PRIO_BUTTON);
 
   /* OLED 显示更新 */
-  xTaskCreate(OLED_Update_Task, "OLED", STACK_OLED, NULL,
-              PRIO_OLED, NULL);
+  CreateTaskOrHalt(OLED_Update_Task, "OLED", STACK_OLED, NULL, PRIO_OLED);
               
   /* 编码器输出任务 */
-  xTaskCreate(EncoderOutput_Task, "EncoderOut", STACK_BUTTON, NULL,
-              PRIO_OLED, NULL);
+  CreateTaskOrHalt(EncoderOutput_Task, "EncoderOut", STACK_BUTTON, NULL, PRIO_OLED);
               
   /* 偏航角输出任务 */
-    xTaskCreate(YawOutput_Task, "YawOutput", STACK_BUTTON, NULL,
-                PRIO_OLED, NULL);
+    CreateTaskOrHalt(YawOutput_Task, "YawOutput", STACK_BUTTON, NULL, PRIO_OLED);
+
+    /* 雷达诊断输出任务 */
+    CreateTaskOrHalt(LidarDiagnostic_Task, "LidarDiag", STACK_BUTTON, NULL, PRIO_OLED);
                 
     /* 高频调试输出任务 - 暂时禁用，排查问题
     xTaskCreate(HighFreqDebug_Task, "HiFreqDebug", STACK_BUTTON, NULL,
@@ -729,8 +825,7 @@ int main(void)
     */
     
     /* MPU6500 诊断输出任务 */
-    xTaskCreate(MPUDiagnostic_Task, "MPUDiag", STACK_BUTTON, NULL,
-                PRIO_OLED, NULL);
+    CreateTaskOrHalt(MPUDiagnostic_Task, "MPUDiag", STACK_BUTTON, NULL, PRIO_OLED);
 
   /* ---- 启动调度器 ---- */
   SSD1306_Print(0, 0, "AMR Ready");
@@ -1423,11 +1518,36 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
 void Error_Handler(void)
 {
   /* USER CODE BEGIN Error_Handler_Debug */
+  Debug_Print("Error_Handler entered\r\n");
   __disable_irq();
   while (1)
   {
   }
   /* USER CODE END Error_Handler_Debug */
+}
+
+void vApplicationMallocFailedHook(void)
+{
+  Debug_Print("FreeRTOS malloc failed\r\n");
+  Error_Handler();
+}
+
+void vApplicationStackOverflowHook(TaskHandle_t xTask, char *pcTaskName)
+{
+  (void)xTask;
+
+  if (pcTaskName != NULL)
+  {
+    Debug_Print("FreeRTOS stack overflow: ");
+    Debug_Print(pcTaskName);
+    Debug_Print("\r\n");
+  }
+  else
+  {
+    Debug_Print("FreeRTOS stack overflow\r\n");
+  }
+
+  Error_Handler();
 }
 #ifdef USE_FULL_ASSERT
 /**

@@ -26,6 +26,8 @@
 #define configENABLE_BACKWARD_COMPATIBILITY     0
 #define configNUM_THREAD_LOCAL_STORAGE_POINTERS 0
 #define configUSE_APPLICATION_TASK_TAG          0
+#define configCHECK_FOR_STACK_OVERFLOW          2
+#define configUSE_MALLOC_FAILED_HOOK            1
 
 #define configPRIO_BITS                         __NVIC_PRIO_BITS
 #define configLIBRARY_LOWEST_INTERRUPT_PRIORITY 15

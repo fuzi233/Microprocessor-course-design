@@ -34,6 +34,9 @@ static volatile uint32_t s_analyzer_block_count;
 static LidarRawFrame s_latest_raw_frame;
 static LidarSector32Frame s_latest_sector_frame;
 static LidarLocalGridFrame s_latest_grid_frame;
+static LidarRawFrame s_work_raw_frame;
+static LidarLocalGridFrame s_work_grid_frame;
+static LidarSectorAccumulator s_work_sector_acc[LIDAR_SECTOR_COUNT];
 static volatile bool s_snapshot_ready;
 static uint32_t s_published_frame_id;
 static uint32_t s_sector_last_hit_ms[LIDAR_SECTOR_COUNT];
@@ -254,9 +257,6 @@ static void LidarPipeline_SendDescriptorFromISR(uint16_t offset, uint16_t length
 static void LidarAnalyzerTask(void *argument)
 {
   LidarDmaBlockDescriptor descriptor;
-  LidarRawFrame raw_frame;
-  LidarLocalGridFrame grid_frame;
-  LidarSectorAccumulator sector_acc[LIDAR_SECTOR_COUNT];
   TickType_t next_publish_tick;
   TickType_t now_tick;
   TickType_t wait_ticks;
@@ -264,9 +264,9 @@ static void LidarAnalyzerTask(void *argument)
 
   (void)argument;
 
-  LidarPipeline_ResetRawFrame(&raw_frame);
-  LidarPipeline_ResetGridFrame(&grid_frame);
-  memset(sector_acc, 0, sizeof(sector_acc));
+  LidarPipeline_ResetRawFrame(&s_work_raw_frame);
+  LidarPipeline_ResetGridFrame(&s_work_grid_frame);
+  memset(s_work_sector_acc, 0, sizeof(s_work_sector_acc));
 
   next_publish_tick = xTaskGetTickCount() + pdMS_TO_TICKS(LIDAR_ANALYSIS_PERIOD_MS);
 
@@ -280,8 +280,8 @@ static void LidarAnalyzerTask(void *argument)
       RPLidar_ProcessBytes(s_lidar_ctx, &s_lidar_ctx->dma_buffer[descriptor.offset],
                            descriptor.length);
       LidarPipeline_ProcessDecodedNodes(s_lidar_ctx->decoded_nodes, s_lidar_ctx->decoded_node_count,
-                                        descriptor.timestamp_ms, &raw_frame, sector_acc,
-                                        &grid_frame);
+                                        descriptor.timestamp_ms, &s_work_raw_frame,
+                                        s_work_sector_acc, &s_work_grid_frame);
       s_analyzer_block_count++;
     }
 
@@ -289,10 +289,11 @@ static void LidarAnalyzerTask(void *argument)
     while (now_tick >= next_publish_tick)
     {
       publish_timestamp_ms = HAL_GetTick();
-      LidarPipeline_PublishSnapshots(publish_timestamp_ms, &raw_frame, sector_acc, &grid_frame);
-      LidarPipeline_ResetRawFrame(&raw_frame);
-      LidarPipeline_ResetGridFrame(&grid_frame);
-      memset(sector_acc, 0, sizeof(sector_acc));
+      LidarPipeline_PublishSnapshots(publish_timestamp_ms, &s_work_raw_frame,
+                                     s_work_sector_acc, &s_work_grid_frame);
+      LidarPipeline_ResetRawFrame(&s_work_raw_frame);
+      LidarPipeline_ResetGridFrame(&s_work_grid_frame);
+      memset(s_work_sector_acc, 0, sizeof(s_work_sector_acc));
       next_publish_tick += pdMS_TO_TICKS(LIDAR_ANALYSIS_PERIOD_MS);
     }
   }
@@ -352,53 +353,47 @@ static void LidarPipeline_PublishSnapshots(uint32_t timestamp_ms, const LidarRaw
                                            const LidarSectorAccumulator sector_acc[LIDAR_SECTOR_COUNT],
                                            const LidarLocalGridFrame *grid_frame)
 {
-  LidarRawFrame raw_snapshot;
-  LidarSector32Frame sector_snapshot;
-  LidarLocalGridFrame grid_snapshot;
   uint32_t frame_id;
   uint32_t i;
 
   frame_id = ++s_published_frame_id;
 
-  raw_snapshot = *raw_frame;
-  raw_snapshot.frame_id = frame_id;
-  raw_snapshot.timestamp_ms = timestamp_ms;
+  taskENTER_CRITICAL();
 
-  memset(&sector_snapshot, 0, sizeof(sector_snapshot));
-  sector_snapshot.frame_id = frame_id;
-  sector_snapshot.timestamp_ms = timestamp_ms;
-  sector_snapshot.sector_count = LIDAR_SECTOR_COUNT;
+  s_latest_raw_frame = *raw_frame;
+  s_latest_raw_frame.frame_id = frame_id;
+  s_latest_raw_frame.timestamp_ms = timestamp_ms;
+
+  memset(&s_latest_sector_frame, 0, sizeof(s_latest_sector_frame));
+  s_latest_sector_frame.frame_id = frame_id;
+  s_latest_sector_frame.timestamp_ms = timestamp_ms;
+  s_latest_sector_frame.sector_count = LIDAR_SECTOR_COUNT;
 
   for (i = 0U; i < LIDAR_SECTOR_COUNT; ++i)
   {
     if (sector_acc[i].hit_count > 0U)
     {
-      sector_snapshot.sectors[i].valid = true;
-      sector_snapshot.sectors[i].hit_count = sector_acc[i].hit_count;
-      sector_snapshot.sectors[i].min_distance_mm = sector_acc[i].min_distance_mm;
-      sector_snapshot.sectors[i].mean_distance_mm =
+      s_latest_sector_frame.sectors[i].valid = true;
+      s_latest_sector_frame.sectors[i].hit_count = sector_acc[i].hit_count;
+      s_latest_sector_frame.sectors[i].min_distance_mm = sector_acc[i].min_distance_mm;
+      s_latest_sector_frame.sectors[i].mean_distance_mm =
           (uint16_t)(sector_acc[i].sum_distance_mm / sector_acc[i].hit_count);
-      sector_snapshot.sectors[i].stale_ms = 0U;
+      s_latest_sector_frame.sectors[i].stale_ms = 0U;
     }
     else
     {
-      sector_snapshot.sectors[i].valid = false;
-      sector_snapshot.sectors[i].hit_count = 0U;
-      sector_snapshot.sectors[i].min_distance_mm = 0U;
-      sector_snapshot.sectors[i].mean_distance_mm = 0U;
-      sector_snapshot.sectors[i].stale_ms =
+      s_latest_sector_frame.sectors[i].valid = false;
+      s_latest_sector_frame.sectors[i].hit_count = 0U;
+      s_latest_sector_frame.sectors[i].min_distance_mm = 0U;
+      s_latest_sector_frame.sectors[i].mean_distance_mm = 0U;
+      s_latest_sector_frame.sectors[i].stale_ms =
           (s_sector_last_hit_ms[i] == 0U) ? UINT32_MAX : (timestamp_ms - s_sector_last_hit_ms[i]);
     }
   }
 
-  grid_snapshot = *grid_frame;
-  grid_snapshot.frame_id = frame_id;
-  grid_snapshot.timestamp_ms = timestamp_ms;
-
-  taskENTER_CRITICAL();
-  s_latest_raw_frame = raw_snapshot;
-  s_latest_sector_frame = sector_snapshot;
-  s_latest_grid_frame = grid_snapshot;
+  s_latest_grid_frame = *grid_frame;
+  s_latest_grid_frame.frame_id = frame_id;
+  s_latest_grid_frame.timestamp_ms = timestamp_ms;
   s_snapshot_ready = true;
   taskEXIT_CRITICAL();
 }
