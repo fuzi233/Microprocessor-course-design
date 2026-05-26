@@ -1,0 +1,14 @@
+Debug/
+.settings/
+*.elf
+*.map
+*.list
+*.o
+*.d
+*.su
+*.cyclo
+*.launch
+.cproject
+.project
+CodingDay.cfg
+CodingDay.ioc
